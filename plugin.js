@@ -10,6 +10,7 @@
 		lang: 'en', // %REMOVE_LINE_CORE%
 		init: function( editor ) {
 			var manager = new UploadManager();
+			manager.url = editor.config.filebrowserImageUploadUrl;
 
 			editor.widgets.add( 'uploadimage', {
 				parts: {
@@ -28,7 +29,6 @@
 				},
 
 				init: function() {
-					manager.upload( this.parts.img.getAttribute( 'src' ) );
 				},
 
 				data: function( data ) {
@@ -38,39 +38,26 @@
 			editor.on( 'paste', function( evt ) {
 				var data = evt.data,
 					dataTransfer = data.dataTransfer,
-					filesCount = dataTransfer.getFilesCount();
+					filesCount = dataTransfer.getFilesCount(),
+					file, i;
 
 				if ( data.dataValue || !filesCount ) {
 					return;
 				}
 
-				var loadedFilesCount = 0,
-					file, reader, i;
-
-				evt.cancel();
-
 				dataTransfer.cacheData();
 
 				for ( i = 0; i < filesCount; i++ ) {
-					file = dataTransfer.getFile( i ),
-					reader = new FileReader();
+					file = dataTransfer.getFile( i );
 
-					reader.onload = function( evt ) {
-						var img = new CKEDITOR.dom.element( 'img' );
-						img.setAttributes( {
-							'src': evt.target.result,
-							'data-cke-file-name': file.name
-						} );
-						data.dataValue += img.getOuterHtml();
+					var upload = manager.upload( file ),
+						img = new CKEDITOR.dom.element( 'img' );
 
-						loadedFilesCount++;
-
-						if ( loadedFilesCount == filesCount ) {
-							editor.fire( 'paste', data );
-						}
-					};
-
-					reader.readAsDataURL( file );
+					img.setAttributes( {
+						// 'src': //data:black rectangle,
+						'data-cke-upload-id': upload.id
+					} );
+					data.dataValue += img.getOuterHtml();
 				}
 			} );
 
@@ -85,10 +72,12 @@
 				for ( i = 0; i < imgs.count(); i++ ) {
 					img = imgs.getItem( i );
 
-					if ( img.getAttribute( 'src' ).substring( 0, 5 ) == 'data:' && !inEditableBlock( img ) ) {
+					var isDataInSrc = img.getAttribute( 'src' ) && img.getAttribute( 'src' ).substring( 0, 5 ) == 'data:';
+					if ( !img.data( 'cke-upload-id' ) && !inEditableBlock( img ) && isDataInSrc ) {
+						var upload = manager.upload( img.getAttribute( 'src' ) );
+
 						img.setAttributes( {
-							'data-cke-special-image': 1,
-							'data-cke-image-to-upload': 1
+							'data-cke-upload-id': upload.id
 						} );
 					}
 				}
@@ -140,28 +129,148 @@
 	}
 
 	function UploadManager() {
+		this._ = {
+			uploads: []
+		}
 	}
 
 	UploadManager.prototype = {
-		upload: function( data ) {
-			var file = srcToBlob( data ),
-				xhr = new XMLHttpRequest(),
-				formData = new FormData();
+		upload: function( fileOrData, fileName ) {
+			var id = this._.uploads.length,
+				upload = new Upload( this.url, fileOrData, fileName );
 
-			formData.append( 'upload', file );
+			upload.id = id;
+			this._.uploads[ id ] = upload;
 
-			xhr.open( "POST", editor.config.filebrowserImageUploadUrl, true ); // method, url, async
+			upload.start();
 
-			xhr.onreadystatechange = function() {
-				if ( xhr.readyState == 4 ) { // completed
-					if ( xhr.status == 200 ) { // OK
-						console.log( 'onreadystatechange:' );
-						console.log( xhr.responseText );
-					}
-				}
+			return upload;
+		},
+		getUpload: function( id ) {
+			return this._.uploads[ id ];
+		},
+		refreshStatuses: function() {
+			for ( var i = 0; i < uploads.length; i++ ) {
+				uploads[ i ].fireStatus();
+			}
+		}
+	};
+
+	function Upload( url, fileOrData, fileName ) {
+		var that = this;
+
+		this.url = url;
+
+		if ( typeof fileOrData === 'string' ) {
+			// Data are already loaded from disc.
+			this.file = srcToBlob( fileOrData );
+			this.loaded = this.total;
+		} else {
+			this.file = fileOrData;
+			this.loaded = 0;
+		}
+
+		if ( fileName ) {
+			this.fileName = fileName;
+		} else {
+			this.fileName = this.file.name;
+		}
+
+		this.total = this.file.size;
+		this.uploaded = 0;
+
+		this.changeAndFireStatus( 'created' );
+	}
+
+	Upload.prototype = {
+		start: function() {
+			if ( this.loaded == this.total ) {
+				this.sendFile();
+			} else {
+				this.loadAndSendFile();
+			}
+		},
+		loadAndSendFile: function() {
+			var reader = new FileReader(),
+				upload = this;
+
+			upload.changeAndFireStatus( 'loading' );
+
+			reader.onabort = function( evt ) {
+				upload.changeAndFireStatus( 'abort' );
+			};
+
+			reader.onerror = function( evt ) {
+				upload.changeAndFireStatus( 'error' );
+			};
+
+			reader.onprogress = function( evt ) {
+				this.loaded = evt.loaded;
+				upload.fire( 'loading' );
+			};
+
+			reader.onload = function( evt ) {
+				upload.loaded = upload.total;
+
+				upload.sendFile();
+			};
+
+			this.abort = function() {
+				reader.abort();
 			}
 
+			reader.readAsDataURL( this.file );
+		},
+
+		sendFile: function() {
+			var xhr = new XMLHttpRequest(),
+				formData = new FormData(),
+				upload = this;
+
+			upload.changeAndFireStatus( 'uploading' );
+
+			xhr.onabort = function( evt ) {
+				upload.changeAndFireStatus( 'abort' );
+			};
+
+			xhr.onerror = function( evt ) {
+				upload.changeAndFireStatus( 'error' );
+			};
+
+			xhr.onprogress = function( evt ) {
+				this.uploaded = evt.loaded;
+				upload.fireStatus();
+			};
+
+			xhr.onload = function( evt ) {
+				upload.changeAndFireStatus( 'done' );
+			};
+
+			upload.abort = function() {
+				xhr.abort();
+			}
+
+			formData.append( 'upload', this.file );
+			xhr.open( "POST", this.url, true );
 			xhr.send( formData );
+		},
+		changeAndFireStatus: function( newStatus ) {
+			var noopFunction = function() {};
+
+			this.status = newStatus;
+
+			if ( newStatus =='created' || newStatus =='error' ||
+				newStatus =='abort' || newStatus =='done' ) {
+				this.abort = noopFunction;
+			}
+
+			this.fire( newStatus );
+			this.fireStatus();
+		},
+		fireStatus: function() {
+			this.fire( 'updateStatus' );
 		}
 	}
+
+	CKEDITOR.event.implementOn( Upload.prototype );
 } )();
